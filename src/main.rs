@@ -10,7 +10,9 @@ fn main() -> Result<()> {
     // A configured container joins classes per block and streams via chunked
     // synthetic documents.
     if config.uses_container() {
-        if config.fix {
+        if config.resolve {
+            join::run_join_resolve(&config)?;
+        } else if config.fix {
             join::run_join_fix(&config)?;
         } else if join::run_join_check(&config)? > 0 {
             std::process::exit(1);

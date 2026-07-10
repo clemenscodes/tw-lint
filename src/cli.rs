@@ -37,6 +37,11 @@ pub struct CliArgs {
     pub node: Option<PathBuf>,
     #[arg(long)]
     pub fix: bool,
+    /// Interactively resolve conflicts: for each conflict, show the file and the
+    /// two clashing classes and let YOU pick which to keep. The tool applies your
+    /// choice; it never guesses.
+    #[arg(long)]
+    pub resolve: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,6 +60,7 @@ pub struct LintConfig {
     pub server_command: String,
     pub node: Option<PathBuf>,
     pub fix: bool,
+    pub resolve: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -150,6 +156,7 @@ impl LintConfig {
             server_command,
             node,
             fix: args.fix,
+            resolve: args.resolve,
         })
     }
 
@@ -179,6 +186,7 @@ mod tests {
             server: None,
             node: None,
             fix: false,
+            resolve: false,
         }
     }
 

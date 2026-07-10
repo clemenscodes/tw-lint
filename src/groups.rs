@@ -128,6 +128,7 @@ mod tests {
             server_command: "x".into(),
             node: None,
             fix: false,
+            resolve: false,
         };
         GroupMatcher::from_config(&config).unwrap()
     }

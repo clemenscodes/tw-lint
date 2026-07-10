@@ -21,6 +21,7 @@ fn fixture_config() -> LintConfig {
         server_command: "tailwindcss-language-server".to_string(),
         node: None,
         fix: false,
+        resolve: false,
         root,
     }
 }

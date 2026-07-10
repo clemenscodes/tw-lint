@@ -145,6 +145,33 @@ fn canonical_replacement(message: &str) -> Option<String> {
         .map(|value| value.as_str().to_string())
 }
 
+/// The two class names in a cssConflict message
+/// (`'A' applies the same CSS properties as 'B'.` → `("A", "B")`).
+fn conflict_pair(message: &str) -> Option<(String, String)> {
+    let quoted = Regex::new(r"'([^']+)'").expect("valid regex");
+    let mut names = quoted
+        .captures_iter(message)
+        .filter_map(|capture| capture.get(1).map(|name| name.as_str().to_string()));
+    let first = names.next()?;
+    let second = names.next()?;
+    Some((first, second))
+}
+
+/// Print the file's path as a header the first time a diagnostic in it is shown.
+fn print_file_header(
+    out: &mut impl Write,
+    palette: &Palette,
+    root: &Path,
+    group: &ClassGroup,
+    last_file: &mut Option<PathBuf>,
+) {
+    if last_file.as_deref() != Some(group.file.as_path()) {
+        let rel = relative(&group.file, root);
+        let _ = writeln!(out, "\n{}{}{}", palette.bold, rel.display(), palette.reset);
+        *last_file = Some(group.file.clone());
+    }
+}
+
 /// Stream diagnostics to stdout as each chunk completes; return the fatal count.
 pub fn run_join_check(config: &LintConfig) -> Result<usize> {
     let matcher = GroupMatcher::from_config(config)?;
@@ -157,44 +184,62 @@ pub fn run_join_check(config: &LintConfig) -> Result<usize> {
     let mut fixable = 0;
     let mut conflicts = 0;
     let mut last_file: Option<PathBuf> = None;
+    // The LSP reports each conflict twice (A vs B and B vs A); collapse them.
+    let mut seen_conflicts: std::collections::HashSet<(PathBuf, u32, String)> =
+        std::collections::HashSet::new();
     let mut out = std::io::stdout().lock();
 
     for (chunk_index, chunk) in corpus.groups.chunks(CHUNK_SIZE).enumerate() {
         let document = build_document(chunk);
         let uri = chunk_uri(config, chunk_index)?;
-        let diagnostics = diagnose(&mut client, &uri, document)?;
-        for diagnostic in diagnostics {
+        let mut diagnostics = diagnose(&mut client, &uri, document)?;
+        diagnostics.sort_by_key(|diagnostic| {
+            (
+                diagnostic.range.start.line,
+                diagnostic.range.start.character,
+            )
+        });
+        for diagnostic in &diagnostics {
             let local = diagnostic.range.start.line as usize;
             let group = match chunk.get(local) {
                 Some(group) => group,
                 None => continue,
             };
-            if last_file.as_deref() != Some(group.file.as_path()) {
-                let rel = relative(&group.file, &root);
-                let _ = writeln!(out, "\n{}{}{}", palette.bold, rel.display(), palette.reset);
-                last_file = Some(group.file.clone());
-            }
-            let (color, mark) = if is_canonical(&diagnostic) {
+
+            if is_canonical(diagnostic) {
+                print_file_header(&mut out, &palette, &root, group, &mut last_file);
+                let _ = writeln!(
+                    out,
+                    "  {warn}fix{reset}  {dim}{}{reset}  {}",
+                    group.line,
+                    diagnostic.message,
+                    warn = palette.warn,
+                    reset = palette.reset,
+                    dim = palette.dim,
+                );
                 fixable += 1;
-                (palette.warn, "fix ")
-            } else {
+            } else if is_fatal(diagnostic) {
+                let (a, b) = match conflict_pair(&diagnostic.message) {
+                    Some(pair) => pair,
+                    None => continue,
+                };
+                let mut ordered = [a.clone(), b.clone()];
+                ordered.sort();
+                let key = (group.file.clone(), group.line, ordered.join("\u{0}"));
+                if !seen_conflicts.insert(key) {
+                    continue;
+                }
+                print_file_header(&mut out, &palette, &root, group, &mut last_file);
+                let _ = writeln!(
+                    out,
+                    "  {err}conflict{reset}  {dim}{}{reset}  {a}  ⟷  {b}",
+                    group.line,
+                    err = palette.error,
+                    reset = palette.reset,
+                    dim = palette.dim,
+                );
                 conflicts += 1;
-                (palette.error, "warn")
-            };
-            let _ = writeln!(
-                out,
-                "  {color}{mark}{reset} {dim}{}:{}{reset}  {}",
-                group.line,
-                diagnostic
-                    .range
-                    .start
-                    .character
-                    .saturating_sub(CLASS_VALUE_COLUMN),
-                diagnostic.message,
-                color = color,
-                reset = palette.reset,
-                dim = palette.dim,
-            );
+            }
         }
         let _ = out.flush();
     }
@@ -351,6 +396,160 @@ pub fn run_join_fix(config: &LintConfig) -> Result<()> {
         bold = palette.bold,
         reset = palette.reset,
         err = palette.error,
+    );
+    Ok(())
+}
+
+/// Write every collected block rewrite to disk (end-to-start per file so earlier
+/// spans don't shift later ones).
+fn apply_rewrites(
+    corpus: &Corpus,
+    rewrites: BTreeMap<PathBuf, Vec<(std::ops::Range<usize>, String)>>,
+) -> Result<()> {
+    for (path, mut spans) in rewrites {
+        let mut text = corpus
+            .file_texts
+            .get(&path)
+            .cloned()
+            .context("file text missing")?;
+        spans.sort_by_key(|(span, _)| std::cmp::Reverse(span.start));
+        for (span, replacement) in spans {
+            text.replace_range(span, &replacement);
+        }
+        std::fs::write(&path, text)?;
+    }
+    Ok(())
+}
+
+/// Interactively resolve conflicts: show each one and let the user pick the
+/// class to keep. The tool applies the choice and never guesses.
+pub fn run_join_resolve(config: &LintConfig) -> Result<()> {
+    let matcher = GroupMatcher::from_config(config)?;
+    let corpus = collect_corpus(config, &matcher)?;
+    ensure_blocks_matched(&corpus)?;
+    let root = std::fs::canonicalize(&config.root)?;
+    let palette = Palette::detect();
+    let mut client = Client::launch(config)?;
+
+    // Deduped conflict pairs per block (global group index).
+    let mut conflicts: BTreeMap<usize, Vec<(String, String)>> = BTreeMap::new();
+    let mut seen: std::collections::HashSet<(usize, String)> = std::collections::HashSet::new();
+    for (chunk_index, chunk) in corpus.groups.chunks(CHUNK_SIZE).enumerate() {
+        let base = chunk_index * CHUNK_SIZE;
+        let document = build_document(chunk);
+        let uri = chunk_uri(config, chunk_index)?;
+        let diagnostics = diagnose(&mut client, &uri, document)?;
+        for diagnostic in &diagnostics {
+            if is_canonical(diagnostic) || !is_fatal(diagnostic) {
+                continue;
+            }
+            let (a, b) = match conflict_pair(&diagnostic.message) {
+                Some(pair) => pair,
+                None => continue,
+            };
+            let global = base + diagnostic.range.start.line as usize;
+            let mut ordered = [a, b];
+            ordered.sort();
+            let key = (global, ordered.join("\u{0}"));
+            if seen.insert(key) {
+                let [first, second] = ordered;
+                conflicts.entry(global).or_default().push((first, second));
+            }
+        }
+    }
+    client.shutdown()?;
+
+    let total: usize = conflicts.values().map(Vec::len).sum();
+    if total == 0 {
+        println!("{}✓ no conflicts{}", palette.bold, palette.reset);
+        return Ok(());
+    }
+    println!(
+        "{bold}{total} conflict(s){reset} — pick the class to keep (1/2), s to skip, q to quit\n",
+        bold = palette.bold,
+        reset = palette.reset,
+    );
+
+    let stdin = std::io::stdin();
+    let mut rewrites: BTreeMap<PathBuf, Vec<(std::ops::Range<usize>, String)>> = BTreeMap::new();
+    let mut resolved = 0;
+    let mut index = 0;
+    'outer: for (global, pairs) in &conflicts {
+        let group = &corpus.groups[*global];
+        let mut remove: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (a, b) in pairs {
+            if remove.contains(a) || remove.contains(b) {
+                continue;
+            }
+            index += 1;
+            let rel = relative(&group.file, &root);
+            println!(
+                "{dim}[{index}/{total}]{reset} {bold}{}:{}{reset}",
+                rel.display(),
+                group.line,
+                dim = palette.dim,
+                reset = palette.reset,
+                bold = palette.bold,
+            );
+            println!(
+                "    {warn}1{reset}  {a}",
+                warn = palette.warn,
+                reset = palette.reset
+            );
+            println!(
+                "    {warn}2{reset}  {b}",
+                warn = palette.warn,
+                reset = palette.reset
+            );
+            loop {
+                print!("  keep [1/2/s/q]: ");
+                let _ = std::io::stdout().flush();
+                let mut line = String::new();
+                if stdin.read_line(&mut line)? == 0 {
+                    break 'outer;
+                }
+                match line.trim() {
+                    "1" => {
+                        remove.insert(b.clone());
+                        break;
+                    }
+                    "2" => {
+                        remove.insert(a.clone());
+                        break;
+                    }
+                    "s" | "" => break,
+                    "q" => break 'outer,
+                    _ => continue,
+                }
+            }
+            println!();
+        }
+        if !remove.is_empty() {
+            let kept: Vec<String> = group
+                .classes
+                .iter()
+                .filter(|class| !remove.contains(*class))
+                .cloned()
+                .collect();
+            let layout = corpus
+                .file_texts
+                .get(&group.file)
+                .map(|text| BlockLayout::at(text, group.list_span.start))
+                .unwrap_or_default();
+            let replacement = format_class_list(&kept, &layout);
+            rewrites
+                .entry(group.file.clone())
+                .or_default()
+                .push((group.list_span.clone(), replacement));
+            resolved += remove.len();
+        }
+    }
+
+    apply_rewrites(&corpus, rewrites)?;
+    println!(
+        "\n{bold}✓ removed {resolved} class(es){reset} across your choices",
+        bold = palette.bold,
+        reset = palette.reset,
     );
     Ok(())
 }

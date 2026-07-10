@@ -199,7 +199,14 @@ pub fn run_join_fix(config: &LintConfig) -> Result<()> {
             Some(value) => value.as_str(),
             None => continue,
         };
-        let new_classes: Vec<&str> = value.split_whitespace().collect();
+        // Drop exact duplicate classes (order-preserving) — a class repeated in
+        // one block is dead and safe to remove, unlike a semantic conflict
+        // between two different classes, which stays for a human to resolve.
+        let mut seen = std::collections::HashSet::new();
+        let new_classes: Vec<&str> = value
+            .split_whitespace()
+            .filter(|class| seen.insert(*class))
+            .collect();
         let original: Vec<&str> = group.classes.iter().map(String::as_str).collect();
         if new_classes == original {
             continue;

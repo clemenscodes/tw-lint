@@ -23,6 +23,12 @@ pub struct CliArgs {
     /// Groups classes in one container (e.g. a `tw![…]` block) so cross-class
     /// lints like conflicts fire; without it each --class-regex match is an
     /// isolated single-class context.
+    /// Regex whose match is one class block (e.g. a `tw![…]` macro). All classes
+    /// inside a block are treated as a single space-joined class list — as the
+    /// runtime concatenates them — so the LSP reports whole-list diagnostics
+    /// (canonical merges like `pt-4 pb-4` -> `py-4`, conflicts, duplicates) that
+    /// per-string extraction cannot see. `--fix` rewrites the corrected classes
+    /// back into the block.
     #[arg(long = "class-container")]
     pub class_container: Option<String>,
     #[arg(long)]
@@ -145,6 +151,14 @@ impl LintConfig {
             node,
             fix: args.fix,
         })
+    }
+
+    /// A container regex was configured, so classes must be joined per block and
+    /// linted as one class list (the only correct reading of a container).
+    pub fn uses_container(&self) -> bool {
+        self.class_regexes
+            .iter()
+            .any(|regex| matches!(regex, ClassRegex::Container { .. }))
     }
 }
 

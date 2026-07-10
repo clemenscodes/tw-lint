@@ -51,9 +51,6 @@ impl Client {
             .map_err(|_| anyhow!("root is not an absolute path: {}", root.display()))?;
 
         let settings = tailwind_settings(config);
-        if std::env::var("TW_LINT_DEBUG").is_ok() {
-            eprintln!("[tw-lint] settings = {settings}");
-        }
         let mut client = Self {
             child,
             transport,

@@ -20,13 +20,32 @@ Then invoke the bundled binary (the pinned server is on `PATH` automatically):
 tw-lint \
   --css crates/hotkey-editor/tailwind.input.css \
   --source 'crates/**/*.rs' \
-  --include-lang rust=html \
-  --class-regex 'tw!\s*\[([^\]]*)\]' \
+  --class-container 'tw!\s*\[((?:[^\[\]]|\[[^\]]*\])*)\]' \
   --class-regex '"([^"]*)"'
 ```
 
 Add `--fix` to rewrite in place (format step); omit it to fail on diagnostics
 (CI / lint step).
+
+## Macro blocks: `--class-container` (join)
+
+When your classes live in a macro that concatenates several string arguments —
+`tw!["flex", "items-center", "gap-2"]` — each string is one class, but at
+runtime they form **one** class list. Tailwind's diagnostics operate on the
+whole list, so per-string linting is blind to nearly everything: canonical
+merges (`pt-4 pr-4 pb-4 pl-4` → `p-4`), conflicts, and duplicates only surface
+when the classes are seen together.
+
+`--class-container <regex>` fixes this: tw-lint joins every class inside a block
+into one list, lints that, and (with `--fix`) writes the corrected classes back
+into the block. This is automatic — a container always joins; there is no flag
+to forget. The container regex must be **bracket-aware and escape `]`** so it
+spans arbitrary values like `w-[26cqi]`:
+`tw!\s*\[((?:[^\[\]]|\[[^\]]*\])*)\]`.
+
+`--fix` auto-applies canonical suggestions only. Conflicts are reported but
+never rewritten — which of two conflicting classes to drop is a human decision.
+The fix collapses a block to one line; run your formatter (`rustfmt`) after.
 
 ## Using your own node / language server
 

@@ -19,6 +19,12 @@ pub struct CliArgs {
     pub include_lang: Vec<String>,
     #[arg(long = "class-regex")]
     pub class_regex: Vec<String>,
+    /// Container regex whose match is scanned for classes with --class-regex.
+    /// Groups classes in one container (e.g. a `tw![…]` block) so cross-class
+    /// lints like conflicts fire; without it each --class-regex match is an
+    /// isolated single-class context.
+    #[arg(long = "class-container")]
+    pub class_container: Option<String>,
     #[arg(long)]
     pub server: Option<String>,
     #[arg(long)]
@@ -55,6 +61,7 @@ struct FileConfig {
     include_lang: Vec<String>,
     #[serde(default)]
     class_regex: Vec<String>,
+    class_container: Option<String>,
     server: Option<String>,
     node: Option<PathBuf>,
 }
@@ -106,7 +113,20 @@ impl LintConfig {
         } else {
             args.class_regex
         };
-        let class_regexes = regex_raw.into_iter().map(ClassRegex::Simple).collect();
+        let class_container = args.class_container.or(file.class_container);
+        let class_regexes = match class_container {
+            // Two-level form: one container whose match is scanned for classes
+            // by the inner regex, so classes in one container are grouped.
+            Some(container) => {
+                let class = regex_raw
+                    .into_iter()
+                    .next()
+                    .context("--class-container requires a --class-regex to scan within it")?;
+                let container_regex = ClassRegex::Container { container, class };
+                vec![container_regex]
+            }
+            None => regex_raw.into_iter().map(ClassRegex::Simple).collect(),
+        };
 
         let server_command = args
             .server
@@ -141,6 +161,7 @@ mod tests {
             source: vec!["src/**/*.rs".into()],
             include_lang: vec!["rust=html".into()],
             class_regex: vec![r#"tw!\s*\[([^\]]*)\]"#.into(), r#""([^"]*)""#.into()],
+            class_container: None,
             server: None,
             node: None,
             fix: false,
@@ -172,6 +193,22 @@ mod tests {
         assert_eq!(
             overridden.node.unwrap(),
             PathBuf::from("/opt/node20/bin/node")
+        );
+    }
+
+    #[test]
+    fn class_container_builds_a_two_level_regex() {
+        let mut a = args();
+        a.class_container = Some(r#"tw!\[(.*)\]"#.into());
+        a.class_regex = vec![r#""([^"]*)""#.into()];
+        let resolved = LintConfig::resolve(a).unwrap();
+        assert_eq!(resolved.class_regexes.len(), 1);
+        assert_eq!(
+            resolved.class_regexes[0],
+            ClassRegex::Container {
+                container: r#"tw!\[(.*)\]"#.into(),
+                class: r#""([^"]*)""#.into(),
+            }
         );
     }
 

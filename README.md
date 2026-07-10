@@ -11,7 +11,7 @@ severity or above. `--fix` applies the server's quick-fix edits in place.
 ## Consume as a flake input
 
 ```nix
-inputs.tw-lint.url = "github:<owner>/tw-lint";
+inputs.tw-lint.url = "github:clemenscodes/tw-lint";
 ```
 
 Then invoke the bundled binary (the pinned server is on `PATH` automatically):

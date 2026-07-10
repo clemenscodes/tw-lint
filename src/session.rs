@@ -9,93 +9,112 @@ pub struct FileDiagnostics {
     pub diagnostics: Vec<Diagnostic>,
 }
 
-pub fn run_session(config: &LintConfig) -> Result<Vec<FileDiagnostics>> {
-    let mut client = Client::launch(config)?;
+struct OpenedDocument {
+    uri: Url,
+    text: String,
+    diagnostics: Vec<Diagnostic>,
+}
+
+/// Open a document and collect its diagnostics. Prefers pull diagnostics
+/// (deterministic); falls back to a push barrier when the server has no
+/// diagnostic provider.
+fn open_and_diagnose(
+    client: &mut Client,
+    config: &LintConfig,
+    path: &Path,
+) -> Result<OpenedDocument> {
+    let uri = Url::from_file_path(path)
+        .map_err(|_| anyhow::anyhow!("non-absolute path {}", path.display()))?;
+    let text = std::fs::read_to_string(path)?;
+    let language_id = language_id_for(config, path);
+    client.notify(
+        "textDocument/didOpen",
+        serde_json::json!({ "textDocument": {
+            "uri": uri, "languageId": language_id, "version": 1, "text": text } }),
+    )?;
+
+    let diagnostics = if client.supports_pull_diagnostics() {
+        client.pull_diagnostics(&uri)?
+    } else {
+        // Fallback: a barrier request the server answers only after processing
+        // the didOpen, then drain whatever it published for this document.
+        let _ = client.request(
+            "textDocument/documentColor",
+            serde_json::json!({ "textDocument": { "uri": uri } }),
+        );
+        client
+            .take_diagnostics()
+            .into_iter()
+            .filter(|params| params.uri == uri)
+            .flat_map(|params| params.diagnostics)
+            .collect()
+    };
+
+    Ok(OpenedDocument {
+        uri,
+        text,
+        diagnostics,
+    })
+}
+
+fn each_source<F>(config: &LintConfig, mut visit: F) -> Result<()>
+where
+    F: FnMut(PathBuf) -> Result<()>,
+{
     let root = std::fs::canonicalize(&config.root)?;
-    let mut results = Vec::new();
-
     for source_glob in &config.sources {
-        let pattern = root.join(source_glob);
-        let pattern = pattern.to_string_lossy().into_owned();
+        let pattern = root.join(source_glob).to_string_lossy().into_owned();
         for entry in glob::glob(&pattern).context("invalid --source glob")? {
-            let path = entry?;
-            let uri = Url::from_file_path(&path)
-                .map_err(|_| anyhow::anyhow!("non-absolute path {}", path.display()))?;
-            let text = std::fs::read_to_string(&path)?;
-            let language_id = language_id_for(config, &path);
-
-            client.notify(
-                "textDocument/didOpen",
-                serde_json::json!({ "textDocument": {
-                    "uri": uri, "languageId": language_id, "version": 1, "text": text } }),
-            )?;
-            // Barrier request; ignore its result, keep the diagnostics it flushed.
-            let _ = client.request(
-                "textDocument/documentColor",
-                serde_json::json!({ "textDocument": { "uri": uri } }),
-            );
-            let mut collected = client.take_diagnostics();
-            let diagnostics = collected
-                .drain(..)
-                .filter(|params| params.uri == uri)
-                .flat_map(|params| params.diagnostics)
-                .collect();
-            results.push(FileDiagnostics { path, diagnostics });
+            visit(entry?)?;
         }
     }
+    Ok(())
+}
+
+pub fn run_session(config: &LintConfig) -> Result<Vec<FileDiagnostics>> {
+    let mut client = Client::launch(config)?;
+    let mut results = Vec::new();
+    each_source(config, |path| {
+        let opened = open_and_diagnose(&mut client, config, &path)?;
+        client.close_document(&opened.uri)?;
+        results.push(FileDiagnostics {
+            path,
+            diagnostics: opened.diagnostics,
+        });
+        Ok(())
+    })?;
     client.shutdown()?;
     Ok(results)
 }
 
 pub fn run_fix(config: &LintConfig) -> Result<()> {
     let mut client = Client::launch(config)?;
-    let root = std::fs::canonicalize(&config.root)?;
-    for source_glob in &config.sources {
-        let pattern = root.join(source_glob).to_string_lossy().into_owned();
-        for entry in glob::glob(&pattern).context("invalid --source glob")? {
-            let path = entry?;
-            let uri = Url::from_file_path(&path)
-                .map_err(|_| anyhow::anyhow!("non-absolute path {}", path.display()))?;
-            let text = std::fs::read_to_string(&path)?;
-            client.notify(
-                "textDocument/didOpen",
-                serde_json::json!({ "textDocument": {
-                    "uri": uri, "languageId": language_id_for(config, &path),
-                    "version": 1, "text": text } }),
-            )?;
-            let _ = client.request(
-                "textDocument/documentColor",
-                serde_json::json!({ "textDocument": { "uri": uri } }),
-            );
-            let diagnostics: Vec<Diagnostic> = client
-                .take_diagnostics()
-                .into_iter()
-                .filter(|p| p.uri == uri)
-                .flat_map(|p| p.diagnostics)
-                .collect();
+    each_source(config, |path| {
+        let opened = open_and_diagnose(&mut client, config, &path)?;
 
-            // Gather every edit targeting this file from all code actions, then
-            // apply them in one batch (edits are all in original coordinates).
-            let mut file_edits: Vec<lsp_types::TextEdit> = Vec::new();
-            for diagnostic in &diagnostics {
-                for action in client.code_actions(&uri, diagnostic)? {
-                    if let lsp_types::CodeActionOrCommand::CodeAction(code_action) = action {
-                        if let Some(edit) = code_action.edit {
-                            if let Some(changes) = edit.changes {
-                                if let Some(edits) = changes.get(&uri) {
-                                    file_edits.extend(edits.iter().cloned());
-                                }
+        // Gather every edit targeting this file from all code actions, then
+        // apply them in one batch (edits are all in original coordinates).
+        let mut file_edits: Vec<lsp_types::TextEdit> = Vec::new();
+        for diagnostic in &opened.diagnostics {
+            for action in client.code_actions(&opened.uri, diagnostic)? {
+                if let lsp_types::CodeActionOrCommand::CodeAction(code_action) = action {
+                    if let Some(edit) = code_action.edit {
+                        if let Some(changes) = edit.changes {
+                            if let Some(edits) = changes.get(&opened.uri) {
+                                file_edits.extend(edits.iter().cloned());
                             }
                         }
                     }
                 }
             }
-            if !file_edits.is_empty() {
-                let updated = crate::edits::apply_text_edits(&text, &file_edits);
-                std::fs::write(&path, updated)?;
-            }
         }
-    }
+        if !file_edits.is_empty() {
+            let updated = crate::edits::apply_text_edits(&opened.text, &file_edits);
+            std::fs::write(&path, updated)?;
+        }
+        client.close_document(&opened.uri)?;
+        Ok(())
+    })?;
     client.shutdown()?;
     Ok(())
 }

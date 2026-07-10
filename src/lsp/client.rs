@@ -12,6 +12,7 @@ pub struct Client {
     transport: Transport<BufReader<ChildStdout>, BufWriter<ChildStdin>>,
     settings: Value,
     diagnostics: Vec<PublishDiagnosticsParams>,
+    supports_pull_diagnostics: bool,
 }
 
 impl Client {
@@ -49,11 +50,16 @@ impl Client {
         let root_uri = Url::from_directory_path(&root)
             .map_err(|_| anyhow!("root is not an absolute path: {}", root.display()))?;
 
+        let settings = tailwind_settings(config);
+        if std::env::var("TW_LINT_DEBUG").is_ok() {
+            eprintln!("[tw-lint] settings = {settings}");
+        }
         let mut client = Self {
             child,
             transport,
-            settings: tailwind_settings(config),
+            settings,
             diagnostics: Vec::new(),
+            supports_pull_diagnostics: false,
         };
 
         let init_params = json!({
@@ -63,21 +69,55 @@ impl Client {
                 "workspace": { "configuration": true, "didChangeConfiguration": {} },
                 "textDocument": {
                     "publishDiagnostics": {},
+                    "diagnostic": { "dynamicRegistration": false },
                     "codeAction": { "codeActionLiteralSupport": {
                         "codeActionKind": { "valueSet": ["quickfix", "source"] } } }
                 }
             },
             "workspaceFolders": [ { "uri": root_uri, "name": "root" } ]
         });
-        client.request("initialize", init_params)?;
+        let init_result = client.request("initialize", init_params)?;
+        // The server advertises pull diagnostics via `diagnosticProvider`. When
+        // present we use `textDocument/diagnostic` (a synchronous request whose
+        // response carries the diagnostics) instead of racing async pushes.
+        client.supports_pull_diagnostics = init_result
+            .get("capabilities")
+            .and_then(|caps| caps.get("diagnosticProvider"))
+            .is_some();
         client.notify("initialized", json!({}))?;
         Ok(client)
+    }
+
+    pub fn supports_pull_diagnostics(&self) -> bool {
+        self.supports_pull_diagnostics
+    }
+
+    /// Pull diagnostics for one document (LSP 3.17 `textDocument/diagnostic`).
+    /// Deterministic: the response holds the full diagnostic set, so nothing is
+    /// lost to async publish timing.
+    pub fn pull_diagnostics(&mut self, uri: &Url) -> Result<Vec<lsp_types::Diagnostic>> {
+        let params = json!({ "textDocument": { "uri": uri } });
+        let result = self.request("textDocument/diagnostic", params)?;
+        let items = result
+            .get("items")
+            .cloned()
+            .map(|value| serde_json::from_value(value).unwrap_or_default())
+            .unwrap_or_default();
+        Ok(items)
     }
 
     pub fn notify(&mut self, method: &str, params: Value) -> Result<()> {
         self.transport
             .send_notification(method, params)
             .context("sending notification")
+    }
+
+    /// Close a document so the server releases it. Without this the server
+    /// retains every opened document and eventually runs out of memory on a
+    /// large source tree.
+    pub fn close_document(&mut self, uri: &Url) -> Result<()> {
+        let params = json!({ "textDocument": { "uri": uri } });
+        self.notify("textDocument/didClose", params)
     }
 
     pub fn request(&mut self, method: &str, params: Value) -> Result<Value> {

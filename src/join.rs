@@ -202,17 +202,11 @@ pub fn run_join_check(config: &LintConfig) -> Result<usize> {
 
     let total = fixable + conflicts;
     if total == 0 {
-        let _ = writeln!(
-            out,
-            "\n{}✓ no Tailwind issues{}",
-            palette.bold, palette.reset
-        );
+        let _ = writeln!(out, "\n{}✓ clean{}", palette.bold, palette.reset);
     } else {
         let _ = writeln!(
             out,
-            "\n{bold}{total} issue(s){reset}: {warn}{fixable} auto-fixable{reset} \
-             (canonical + duplicates; run --fix), {err}{conflicts} conflict(s){reset} \
-             to resolve by hand — the tool never deletes a class to settle a conflict",
+            "\n{bold}{total} issues{reset}  {warn}{fixable} fixable{reset}  {err}{conflicts} conflicts{reset}",
             bold = palette.bold,
             reset = palette.reset,
             warn = palette.warn,
@@ -353,8 +347,7 @@ pub fn run_join_fix(config: &LintConfig) -> Result<()> {
     }
     let _ = writeln!(
         out,
-        "\n{bold}✓ {applied} class fix(es) applied{reset}, {reformatted} block(s) reformatted; \
-         {err}{conflicts} conflict(s){reset} reported, NOT changed (resolve by hand — never guessed)",
+        "\n{bold}✓ {applied} fixed  {reformatted} reformatted  {err}{conflicts} conflicts left{reset}",
         bold = palette.bold,
         reset = palette.reset,
         err = palette.error,

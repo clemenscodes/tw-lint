@@ -194,8 +194,9 @@ pub fn run_join_check(config: &LintConfig) -> Result<usize> {
     } else {
         let _ = writeln!(
             out,
-            "\n{bold}{total} issue(s){reset}: {warn}{fixable} auto-fixable{reset} (run --fix), \
-             {err}{conflicts} conflict(s){reset} need manual resolution",
+            "\n{bold}{total} issue(s){reset}: {warn}{fixable} canonical{reset}, \
+             {err}{conflicts} conflict(s){reset} — all cleared by --fix \
+             (conflicts resolved by keeping the last class; review the diff)",
             bold = palette.bold,
             reset = palette.reset,
             warn = palette.warn,
@@ -266,15 +267,21 @@ pub fn run_join_fix(config: &LintConfig) -> Result<()> {
         for (local, group) in chunk.iter().enumerate() {
             let mut edits = edits_by_block.remove(&local).unwrap_or_default();
             let block_conflicts = conflicts_by_block.remove(&local).unwrap_or_default();
-            let resolved = conflict_deletions(&block_conflicts);
-            conflicts += resolved.len();
-            merge_conflict_deletions(&mut edits, resolved);
-            if let Some(new_classes) = rewrite_classes(group, &edits) {
-                let replacement = new_classes
-                    .iter()
-                    .map(|class| format!("\"{class}\""))
-                    .collect::<Vec<_>>()
-                    .join(", ");
+            let deletions = conflict_deletions(&block_conflicts);
+            conflicts += deletions.len();
+            merge_conflict_deletions(&mut edits, deletions);
+            let resolved = resolve_classes(group, &edits);
+            let text = corpus.file_texts.get(&group.file);
+            let layout = text
+                .map(|text| BlockLayout::at(text, group.list_span.start))
+                .unwrap_or_default();
+            let replacement = format_class_list(&resolved, &layout);
+            // Rewrite when the class list changed OR the block is not already in
+            // canonical layout (re-wrapping collapsed blocks rustfmt won't touch).
+            let current = text
+                .and_then(|text| text.get(group.list_span.clone()))
+                .unwrap_or("");
+            if replacement != current {
                 rewrites
                     .entry(group.file.clone())
                     .or_default()
@@ -307,7 +314,7 @@ pub fn run_join_fix(config: &LintConfig) -> Result<()> {
     }
     let _ = writeln!(
         out,
-        "{bold}✓ fixed {fixed_blocks} block(s){reset} \
+        "{bold}✓ updated {fixed_blocks} block(s){reset} \
          ({conflicts} conflict(s) resolved by keeping the last conflicting class)",
         bold = palette.bold,
         reset = palette.reset,
@@ -419,10 +426,68 @@ fn merge_conflict_deletions(edits: &mut Vec<ValueEdit>, deletions: Vec<ValueEdit
     edits.extend(deletions);
 }
 
-/// Compute a block's new class list: apply canonical value-edits and conflict
-/// deletions, then drop exact duplicates (order-preserving). Returns None when
-/// nothing changed.
-fn rewrite_classes(group: &ClassGroup, edits: &[ValueEdit]) -> Option<Vec<String>> {
+fn leading_whitespace(line: &str) -> String {
+    line.chars()
+        .take_while(|character| *character == ' ' || *character == '\t')
+        .collect()
+}
+
+/// The indentation of the block's line and how many columns precede its class
+/// list (`    base: tw![`), so a rewrite can match the surrounding layout.
+#[derive(Default)]
+struct BlockLayout {
+    indent: String,
+    prefix_columns: usize,
+}
+
+impl BlockLayout {
+    fn at(text: &str, list_start: usize) -> Self {
+        let line_start = text[..list_start]
+            .rfind('\n')
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        let prefix = &text[line_start..list_start];
+        Self {
+            indent: leading_whitespace(prefix),
+            prefix_columns: prefix.chars().count(),
+        }
+    }
+}
+
+/// rustfmt's default line width. rustfmt does not re-wrap custom-macro bodies,
+/// so tw-lint emits the final shape itself: one class per line when the block
+/// would exceed this width, otherwise inline.
+const MAX_LINE_WIDTH: usize = 100;
+
+/// Render the class list back into the block: inline (`"a", "b"`) when it fits
+/// on one line, else one class per line indented one level past the block.
+fn format_class_list(classes: &[String], layout: &BlockLayout) -> String {
+    let inline = classes
+        .iter()
+        .map(|class| format!("\"{class}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // prefix (`    base: tw![`) + inline + closing `],`
+    if layout.prefix_columns + inline.chars().count() + 2 <= MAX_LINE_WIDTH {
+        return inline;
+    }
+    let item_indent = format!("{}    ", layout.indent);
+    let mut rendered = String::new();
+    for class in classes {
+        rendered.push('\n');
+        rendered.push_str(&item_indent);
+        rendered.push('"');
+        rendered.push_str(class);
+        rendered.push_str("\",");
+    }
+    rendered.push('\n');
+    rendered.push_str(&layout.indent);
+    rendered
+}
+
+/// Compute a block's resolved class list: apply canonical value-edits and
+/// conflict deletions, then drop exact duplicates (order-preserving).
+fn resolve_classes(group: &ClassGroup, edits: &[ValueEdit]) -> Vec<String> {
     let value = group.classes.join(" ");
     let mut ordered: Vec<&ValueEdit> = edits.iter().collect();
     ordered.sort_by_key(|edit| std::cmp::Reverse(edit.start));
@@ -436,17 +501,11 @@ fn rewrite_classes(group: &ClassGroup, edits: &[ValueEdit]) -> Option<Vec<String
     let fixed: String = buffer.into_iter().collect();
 
     let mut seen = std::collections::HashSet::new();
-    let new_classes: Vec<String> = fixed
+    fixed
         .split_whitespace()
         .filter(|class| seen.insert(class.to_string()))
         .map(str::to_string)
-        .collect();
-
-    if new_classes == group.classes {
-        None
-    } else {
-        Some(new_classes)
-    }
+        .collect()
 }
 
 #[cfg(test)]

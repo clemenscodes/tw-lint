@@ -20,7 +20,7 @@ Then invoke the bundled binary (the pinned server is on `PATH` automatically):
 tw-lint \
   --css crates/hotkey-editor/tailwind.input.css \
   --source 'crates/**/*.rs' \
-  --class-container 'tw!\s*\[((?:[^\[\]]|\[[^\]]*\])*)\]' \
+  --class-container 'tw!\s*\[' \
   --class-regex '"([^"]*)"'
 ```
 
@@ -39,9 +39,10 @@ when the classes are seen together.
 `--class-container <regex>` fixes this: tw-lint joins every class inside a block
 into one list, lints that, and (with `--fix`) writes the corrected classes back
 into the block. This is automatic — a container always joins; there is no flag
-to forget. The container regex must be **bracket-aware and escape `]`** so it
-spans arbitrary values like `w-[26cqi]`:
-`tw!\s*\[((?:[^\[\]]|\[[^\]]*\])*)\]`.
+to forget. The regex is just the macro **opener** (`tw!\s*\[`); tw-lint then
+scans for the matching `]` with a bracket counter that skips string contents, so
+nested brackets in a class value (`[[role=button]]`, `[&:has(.x)]`) are handled
+correctly — something a regex cannot do.
 
 `--fix` resolves everything the linter reports: canonical suggestions, exact
 duplicates, and conflicts. A conflict (two classes fighting over one CSS

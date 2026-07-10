@@ -30,6 +30,32 @@ Consequence: `--check` catches canonicalization with the diagnostic stream
 alone; no code-action sweep is needed for detection. Code actions are still
 requested in `--fix` mode to obtain the replacement edit.
 
+## Whole-list diagnostics need JOINED classes (the big one)
+
+Tailwind's diagnostics operate on a whole class **list**, not per class. Most of
+`suggestCanonicalClasses` fires on MULTIPLE classes together (`pt-4 pr-4 pb-4
+pl-4` → `p-4`), and `cssConflict` needs the conflicting classes in one list.
+A macro like `tw!["a","b","c"]` puts each class in its own string, so
+per-string extraction (even the two-level container classRegex, which the LSP
+does NOT merge) reports almost nothing — on warcraft it found 0 where 161 exist.
+
+Fix: tw-lint JOINS every class in a container block into one synthetic
+`<div class="…">` and lints that. `--fix` derives each canonical rewrite from
+the diagnostic's own range + message (`can be written as \`Y\``) and writes the
+corrected list back into the block — no `textDocument/codeAction` round-trips
+(161 of them OOM-crash the server on a large corpus). Exact-duplicate classes
+are dropped; semantic conflicts (two different classes) are report-only.
+
+## Chunking + push-wait (streaming AND correctness)
+
+The synthetic corpus is linted in CHUNKS of ~120 blocks, each its own document,
+`didClose`d after — so the server never holds the whole corpus and results
+stream per chunk. Crucially, per chunk you must **wait for the server's
+`publishDiagnostics` push** for that document (`collect_diagnostics_for`): a
+`textDocument/diagnostic` PULL right after `didOpen` races the server's
+debounced analysis and returns empty for all but the first chunk (161 → 9). The
+push notification is the only deterministic "analysis complete" signal.
+
 ## Reliability at scale: pull diagnostics + didClose (both required)
 
 Two bugs surfaced running against a 508-file tree:

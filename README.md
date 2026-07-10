@@ -43,9 +43,12 @@ to forget. The container regex must be **bracket-aware and escape `]`** so it
 spans arbitrary values like `w-[26cqi]`:
 `tw!\s*\[((?:[^\[\]]|\[[^\]]*\])*)\]`.
 
-`--fix` auto-applies canonical suggestions only. Conflicts are reported but
-never rewritten — which of two conflicting classes to drop is a human decision.
-The fix collapses a block to one line; run your formatter (`rustfmt`) after.
+`--fix` resolves everything the linter reports: canonical suggestions, exact
+duplicates, and conflicts. A conflict (two classes fighting over one CSS
+property) is resolved by keeping the class that appears **last** in source order
+— the developer's final intent — and dropping the earlier ones. That is a
+semantic change, so review the `--fix` diff. The fix collapses a block to one
+line; run your formatter (`rustfmt`) after.
 
 ## Using your own node / language server
 

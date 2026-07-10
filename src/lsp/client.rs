@@ -184,6 +184,39 @@ impl Client {
         std::mem::take(&mut self.diagnostics)
     }
 
+    /// Block until the server pushes `publishDiagnostics` for `uri` — the only
+    /// deterministic "analysis complete" signal (a pull races the server's
+    /// debounced analysis and returns empty). Server-side requests that arrive
+    /// meanwhile (config pulls, etc.) are answered.
+    pub fn collect_diagnostics_for(&mut self, uri: &Url) -> Result<Vec<lsp_types::Diagnostic>> {
+        if let Some(index) = self
+            .diagnostics
+            .iter()
+            .position(|params| &params.uri == uri)
+        {
+            return Ok(self.diagnostics.remove(index).diagnostics);
+        }
+        loop {
+            let message = self
+                .transport
+                .read()
+                .context("reading from server")?
+                .ok_or_else(|| anyhow!("server closed the connection"))?;
+            match message {
+                Message::Notification(note) if note.method == "textDocument/publishDiagnostics" => {
+                    let params: PublishDiagnosticsParams =
+                        serde_json::from_value(note.params).context("parsing diagnostics")?;
+                    if &params.uri == uri {
+                        return Ok(params.diagnostics);
+                    }
+                    self.diagnostics.push(params);
+                }
+                Message::Notification(_) | Message::Response(_) => {}
+                Message::Request(server_request) => self.answer(server_request)?,
+            }
+        }
+    }
+
     pub fn code_actions(
         &mut self,
         uri: &Url,

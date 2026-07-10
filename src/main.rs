@@ -7,10 +7,15 @@ fn main() -> Result<()> {
     let args = CliArgs::parse();
     let config = LintConfig::resolve(args)?;
 
+    if config.fix {
+        session::run_fix(&config)?;
+        return Ok(());
+    }
+
     let results = session::run_session(&config)?;
     print!("{}", report::render(&results));
 
-    if !config.fix && report::fatal_count(&results) > 0 {
+    if report::fatal_count(&results) > 0 {
         std::process::exit(1);
     }
     Ok(())

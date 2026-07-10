@@ -147,6 +147,21 @@ impl Client {
         std::mem::take(&mut self.diagnostics)
     }
 
+    pub fn code_actions(
+        &mut self,
+        uri: &Url,
+        diagnostic: &lsp_types::Diagnostic,
+    ) -> Result<Vec<lsp_types::CodeActionOrCommand>> {
+        let params = json!({
+            "textDocument": { "uri": uri },
+            "range": diagnostic.range,
+            "context": { "diagnostics": [diagnostic] }
+        });
+        let result = self.request("textDocument/codeAction", params)?;
+        let actions = serde_json::from_value(result).unwrap_or_default();
+        Ok(actions)
+    }
+
     pub fn shutdown(mut self) -> Result<()> {
         self.request("shutdown", Value::Null)?;
         self.notify("exit", Value::Null)?;

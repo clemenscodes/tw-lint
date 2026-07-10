@@ -45,6 +45,15 @@ consumer's own `tailwindcss` version: the server still loads the *consumer's*
 comes from the pinned server. Consumers add one flake input and invoke
 `tw-lint` from their existing task runner.
 
+**The bundled versions are a default, not a lock.** A user is never limited to
+the flake's node/server: `--server <path-or-command>` selects the
+language-server executable (default: `tailwindcss-language-server` on `PATH`,
+i.e. the bundled one) and `--node <path>` runs it with a chosen Node
+(`<node> <server> --stdio`, for when the server is a `.js` entry or a specific
+runtime is required). This lets a consumer track a newer/older
+`tailwindcss-language-server` — and, through the server's own module
+resolution, a specific `tailwindcss` — without rebuilding tw-lint.
+
 ## Configuration
 
 Two equivalent, overlapping sources — a config file is **optional**:
@@ -60,6 +69,11 @@ Two equivalent, overlapping sources — a config file is **optional**:
   - `--class-regex <regex>` (repeatable) — mirrors
     `tailwindCSS.experimental.classRegex`; supports the two-level
     `[containerRegex, classRegex]` form for macro bodies.
+  - `--server <path-or-command>` — language-server executable to launch
+    (default: `tailwindcss-language-server`, i.e. the flake-bundled one; env
+    `TW_LINT_SERVER` overrides the default).
+  - `--node <path>` — optional Node runtime; when set, the server is launched
+    as `<node> <server> --stdio`.
   - `--fix` — apply fixes in place instead of only reporting.
 
 Flags override file values where both are given. Precedence and the full flag

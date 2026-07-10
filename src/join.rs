@@ -234,21 +234,29 @@ pub fn run_join_fix(config: &LintConfig) -> Result<()> {
     let matcher = GroupMatcher::from_config(config)?;
     let corpus = collect_corpus(config, &matcher)?;
     ensure_blocks_matched(&corpus)?;
+    let root = std::fs::canonicalize(&config.root)?;
     let palette = Palette::detect();
-    let total_blocks = corpus.groups.len();
     let mut client = Client::launch(config)?;
     let mut out = std::io::stdout().lock();
 
     // Per file: (list byte-span, replacement source) for every changed block.
     let mut rewrites: BTreeMap<PathBuf, Vec<(std::ops::Range<usize>, String)>> = BTreeMap::new();
-    let mut fixed_blocks = 0;
+    let mut applied = 0;
+    let mut reformatted = 0;
     let mut conflicts = 0;
-    let mut scanned = 0;
+    let mut last_file: Option<PathBuf> = None;
 
     for (chunk_index, chunk) in corpus.groups.chunks(CHUNK_SIZE).enumerate() {
         let document = build_document(chunk);
         let uri = chunk_uri(config, chunk_index)?;
-        let diagnostics = diagnose(&mut client, &uri, document)?;
+        let mut diagnostics = diagnose(&mut client, &uri, document)?;
+        // Stream in source order (block, then column within a block).
+        diagnostics.sort_by_key(|diagnostic| {
+            (
+                diagnostic.range.start.line,
+                diagnostic.range.start.character,
+            )
+        });
 
         // Only the guaranteed-safe fixes are applied: canonical rewrites and
         // exact-duplicate removal. Conflicts (two DIFFERENT classes fighting
@@ -257,6 +265,10 @@ pub fn run_join_fix(config: &LintConfig) -> Result<()> {
         let mut edits_by_block: BTreeMap<usize, Vec<ValueEdit>> = BTreeMap::new();
         for diagnostic in &diagnostics {
             let local = diagnostic.range.start.line as usize;
+            let group = match chunk.get(local) {
+                Some(group) => group,
+                None => continue,
+            };
             if is_canonical(diagnostic) {
                 let start = diagnostic
                     .range
@@ -275,6 +287,24 @@ pub fn run_join_fix(config: &LintConfig) -> Result<()> {
                         replacement,
                     };
                     edits_by_block.entry(local).or_default().push(edit);
+                    // Stream the fix as it is applied.
+                    if last_file.as_deref() != Some(group.file.as_path()) {
+                        let rel = relative(&group.file, &root);
+                        let _ =
+                            writeln!(out, "\n{}{}{}", palette.bold, rel.display(), palette.reset);
+                        last_file = Some(group.file.clone());
+                    }
+                    let _ = writeln!(
+                        out,
+                        "  {}fix{} {}{}{}  {}",
+                        palette.warn,
+                        palette.reset,
+                        palette.dim,
+                        group.line,
+                        palette.reset,
+                        diagnostic.message,
+                    );
+                    applied += 1;
                 }
             } else if is_fatal(diagnostic) {
                 conflicts += 1;
@@ -283,6 +313,7 @@ pub fn run_join_fix(config: &LintConfig) -> Result<()> {
 
         for (local, group) in chunk.iter().enumerate() {
             let edits = edits_by_block.remove(&local).unwrap_or_default();
+            let had_class_fix = !edits.is_empty();
             let resolved = resolve_classes(group, &edits);
             let text = corpus.file_texts.get(&group.file);
             let layout = text
@@ -299,19 +330,14 @@ pub fn run_join_fix(config: &LintConfig) -> Result<()> {
                     .entry(group.file.clone())
                     .or_default()
                     .push((group.list_span.clone(), replacement));
-                fixed_blocks += 1;
+                if !had_class_fix {
+                    reformatted += 1;
+                }
             }
         }
-        scanned += chunk.len();
-        let _ = write!(
-            out,
-            "\r{}scanning {scanned}/{total_blocks} blocks — {fixed_blocks} fixed{}",
-            palette.dim, palette.reset
-        );
         let _ = out.flush();
     }
     client.shutdown()?;
-    let _ = writeln!(out);
 
     for (path, mut spans) in rewrites {
         let mut text = corpus
@@ -327,10 +353,11 @@ pub fn run_join_fix(config: &LintConfig) -> Result<()> {
     }
     let _ = writeln!(
         out,
-        "{bold}✓ updated {fixed_blocks} block(s){reset} \
-         — {conflicts} conflict(s) reported, NOT changed (resolve by hand; the tool never guesses)",
+        "\n{bold}✓ {applied} class fix(es) applied{reset}, {reformatted} block(s) reformatted; \
+         {err}{conflicts} conflict(s){reset} reported, NOT changed (resolve by hand — never guessed)",
         bold = palette.bold,
         reset = palette.reset,
+        err = palette.error,
     );
     Ok(())
 }

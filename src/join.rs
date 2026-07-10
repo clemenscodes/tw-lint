@@ -77,6 +77,21 @@ fn collect_corpus(config: &LintConfig, matcher: &GroupMatcher) -> Result<Corpus>
     Ok(Corpus { groups, file_texts })
 }
 
+/// Refuse to report "clean" when nothing was extracted — a zero-block corpus
+/// almost always means the `--class-container` regex does not match the macro
+/// (e.g. it was written to match the whole block instead of just the opener),
+/// and silently passing is the false-green that must never happen.
+fn ensure_blocks_matched(corpus: &Corpus) -> Result<()> {
+    if corpus.groups.is_empty() {
+        anyhow::bail!(
+            "no class blocks matched --class-container: nothing was linted. \
+             The regex must match only the macro opener (e.g. `tw!\\s*\\[`); \
+             tw-lint scans for the closing bracket itself."
+        );
+    }
+    Ok(())
+}
+
 /// One synthetic HTML document for a chunk: block `i` becomes a `class="…"` on
 /// line `i`, so a diagnostic's line maps straight back to a block in the chunk.
 fn build_document(chunk: &[ClassGroup]) -> String {
@@ -134,6 +149,7 @@ fn canonical_replacement(message: &str) -> Option<String> {
 pub fn run_join_check(config: &LintConfig) -> Result<usize> {
     let matcher = GroupMatcher::from_config(config)?;
     let corpus = collect_corpus(config, &matcher)?;
+    ensure_blocks_matched(&corpus)?;
     let root = std::fs::canonicalize(&config.root)?;
     let palette = Palette::detect();
     let mut client = Client::launch(config)?;
@@ -217,6 +233,7 @@ struct ValueEdit {
 pub fn run_join_fix(config: &LintConfig) -> Result<()> {
     let matcher = GroupMatcher::from_config(config)?;
     let corpus = collect_corpus(config, &matcher)?;
+    ensure_blocks_matched(&corpus)?;
     let palette = Palette::detect();
     let total_blocks = corpus.groups.len();
     let mut client = Client::launch(config)?;

@@ -437,7 +437,6 @@ fn leading_whitespace(line: &str) -> String {
 #[derive(Default)]
 struct BlockLayout {
     indent: String,
-    prefix_columns: usize,
 }
 
 impl BlockLayout {
@@ -446,31 +445,16 @@ impl BlockLayout {
             .rfind('\n')
             .map(|index| index + 1)
             .unwrap_or(0);
-        let prefix = &text[line_start..list_start];
         Self {
-            indent: leading_whitespace(prefix),
-            prefix_columns: prefix.chars().count(),
+            indent: leading_whitespace(&text[line_start..list_start]),
         }
     }
 }
 
-/// rustfmt's default line width. rustfmt does not re-wrap custom-macro bodies,
-/// so tw-lint emits the final shape itself: one class per line when the block
-/// would exceed this width, otherwise inline.
-const MAX_LINE_WIDTH: usize = 100;
-
-/// Render the class list back into the block: inline (`"a", "b"`) when it fits
-/// on one line, else one class per line indented one level past the block.
+/// Render the class list back into the block with EVERY class on its own line,
+/// indented one level past the block. rustfmt does not re-wrap custom-macro
+/// bodies, so tw-lint emits this shape itself.
 fn format_class_list(classes: &[String], layout: &BlockLayout) -> String {
-    let inline = classes
-        .iter()
-        .map(|class| format!("\"{class}\""))
-        .collect::<Vec<_>>()
-        .join(", ");
-    // prefix (`    base: tw![`) + inline + closing `],`
-    if layout.prefix_columns + inline.chars().count() + 2 <= MAX_LINE_WIDTH {
-        return inline;
-    }
     let item_indent = format!("{}    ", layout.indent);
     let mut rendered = String::new();
     for class in classes {

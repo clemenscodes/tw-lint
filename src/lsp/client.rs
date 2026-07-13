@@ -109,6 +109,30 @@ impl Client {
             .context("sending notification")
     }
 
+    /// Open a document once. In join mode a single synthetic document is opened
+    /// and then reused via [`change_document`](Self::change_document) for every
+    /// chunk, so the server holds exactly one document no matter how large the
+    /// corpus is — its memory can never grow with the number of chunks.
+    pub fn open_document(&mut self, uri: &Url, language_id: &str, text: &str) -> Result<()> {
+        let params = json!({ "textDocument": {
+            "uri": uri, "languageId": language_id, "version": 1, "text": text } });
+        self.notify("textDocument/didOpen", params)
+    }
+
+    /// Replace an open document's full content (full-sync `didChange`). Reusing
+    /// one document instead of opening a fresh URI per chunk is what keeps the
+    /// server's memory bounded regardless of corpus size. Any diagnostics still
+    /// buffered for this URI from an earlier version are dropped first, so the
+    /// collect after this change waits for the publish of the new content.
+    pub fn change_document(&mut self, uri: &Url, text: &str, version: i32) -> Result<()> {
+        self.diagnostics.retain(|params| &params.uri != uri);
+        let params = json!({
+            "textDocument": { "uri": uri, "version": version },
+            "contentChanges": [ { "text": text } ]
+        });
+        self.notify("textDocument/didChange", params)
+    }
+
     /// Close a document so the server releases it. Without this the server
     /// retains every opened document and eventually runs out of memory on a
     /// large source tree.

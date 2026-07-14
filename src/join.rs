@@ -8,9 +8,16 @@ use std::collections::BTreeMap;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
-/// Blocks per synthetic document. Small enough that the language server never
-/// holds the whole corpus (it OOMs otherwise), large enough to stay fast.
-const CHUNK_SIZE: usize = 120;
+/// Blocks per synthetic document. Only ever one document is open at a time (it
+/// is reused via `didChange`), so this bounds the *per-validation* document
+/// size, not total memory. The server debounces diagnostics 500ms per change,
+/// so every chunk costs a fixed 500ms of latency; too-small chunks make that
+/// debounce dominate (120 blocks → hundreds of chunks → tens of seconds of pure
+/// waiting). Per-document validation cost, meanwhile, grows superlinearly with
+/// block count and starts to bite past a few thousand blocks. ~2000 is the
+/// empirical sweet spot that minimises `chunks × (500ms + validate(chunk))`
+/// across both class-light and class-heavy corpora.
+const CHUNK_SIZE: usize = 2000;
 
 struct Palette {
     warn: &'static str,

@@ -349,11 +349,91 @@ struct ValueEdit {
     replacement: String,
 }
 
+/// A block's identity across the two fix passes: its file plus the byte offset
+/// where its class list starts (unique within a file), so pass 2 can look up the
+/// edits pass 1 computed without holding every block in memory.
+type BlockKey = (PathBuf, usize);
+
+/// Diagnose one cross-file chunk, recording canonical value-edits keyed by block
+/// and streaming a `fix` line for each. Conflicts are only counted here (they are
+/// resolved by `--resolve`, not `--fix`).
+#[allow(clippy::too_many_arguments)]
+fn diagnose_fix_chunk(
+    client: &mut Client,
+    document: &mut Synthetic,
+    chunk: &[ClassGroup],
+    root: &Path,
+    palette: &Palette,
+    out: &mut impl Write,
+    last_file: &mut Option<PathBuf>,
+    edits_by_block: &mut BTreeMap<BlockKey, Vec<ValueEdit>>,
+    applied: &mut usize,
+    conflicts: &mut usize,
+) -> Result<()> {
+    let mut diagnostics = document.diagnose(client, chunk)?;
+    diagnostics.sort_by_key(|diagnostic| {
+        (
+            diagnostic.range.start.line,
+            diagnostic.range.start.character,
+        )
+    });
+    for diagnostic in &diagnostics {
+        let local = diagnostic.range.start.line as usize;
+        let group = match chunk.get(local) {
+            Some(group) => group,
+            None => continue,
+        };
+        if is_canonical(diagnostic) {
+            let start = diagnostic
+                .range
+                .start
+                .character
+                .saturating_sub(CLASS_VALUE_COLUMN) as usize;
+            let end = diagnostic
+                .range
+                .end
+                .character
+                .saturating_sub(CLASS_VALUE_COLUMN) as usize;
+            if let Some(replacement) = canonical_replacement(&diagnostic.message) {
+                edits_by_block
+                    .entry((group.file.clone(), group.list_span.start))
+                    .or_default()
+                    .push(ValueEdit {
+                        start,
+                        end,
+                        replacement,
+                    });
+                print_file_header(out, palette, root, group, last_file);
+                let _ = writeln!(
+                    out,
+                    "  {}fix{} {}{}{}  {}",
+                    palette.warn,
+                    palette.reset,
+                    palette.dim,
+                    group.line,
+                    palette.reset,
+                    diagnostic.message,
+                );
+                *applied += 1;
+            }
+        } else if is_fatal(diagnostic) {
+            *conflicts += 1;
+        }
+    }
+    let _ = out.flush();
+    Ok(())
+}
+
 /// Apply canonical suggestions (auto) and duplicate removal to every block,
 /// streaming progress; rewrite each changed block in place.
 ///
-/// Processes one file at a time — read, diagnose its blocks in chunks, rewrite,
-/// write, drop — so memory never grows with the corpus.
+/// Two passes, both streaming files one at a time. Pass 1 diagnoses blocks in
+/// cross-file chunks — a *single* `didChange` per chunk, never per file — so the
+/// server only ever sees a handful of document versions; diagnosing per file
+/// (one version each) both pays the 500ms debounce per file and leaks server
+/// memory until it OOMs on a large tree. Pass 2 re-reads each file and rewrites
+/// it from the edits pass 1 recorded. Only the (sparse) edit map lives between
+/// passes, so memory stays bounded no matter how large the corpus is.
 pub fn run_join_fix(config: &LintConfig) -> Result<()> {
     let matcher = GroupMatcher::from_config(config)?;
     let root = std::fs::canonicalize(&config.root)?;
@@ -367,76 +447,57 @@ pub fn run_join_fix(config: &LintConfig) -> Result<()> {
     let mut conflicts = 0;
     let mut last_file: Option<PathBuf> = None;
 
-    let total_blocks = each_source_file(config, &matcher, &root, |path, text, blocks| {
-        // Gather the value-edits for every block in this file, diagnosing its
-        // blocks in chunks so the synthetic document stays small.
-        let mut edits_by_block: BTreeMap<usize, Vec<ValueEdit>> = BTreeMap::new();
-        for (chunk_index, chunk) in blocks.chunks(CHUNK_SIZE).enumerate() {
-            let base = chunk_index * CHUNK_SIZE;
-            let mut diagnostics = document.diagnose(&mut client, chunk)?;
-            diagnostics.sort_by_key(|diagnostic| {
-                (
-                    diagnostic.range.start.line,
-                    diagnostic.range.start.character,
-                )
-            });
-            for diagnostic in &diagnostics {
-                let local = diagnostic.range.start.line as usize;
-                let group = match chunk.get(local) {
-                    Some(group) => group,
-                    None => continue,
-                };
-                if is_canonical(diagnostic) {
-                    let start = diagnostic
-                        .range
-                        .start
-                        .character
-                        .saturating_sub(CLASS_VALUE_COLUMN) as usize;
-                    let end = diagnostic
-                        .range
-                        .end
-                        .character
-                        .saturating_sub(CLASS_VALUE_COLUMN) as usize;
-                    if let Some(replacement) = canonical_replacement(&diagnostic.message) {
-                        let edit = ValueEdit {
-                            start,
-                            end,
-                            replacement,
-                        };
-                        edits_by_block.entry(base + local).or_default().push(edit);
-                        if last_file.as_deref() != Some(path.as_path()) {
-                            let rel = relative(&path, &root);
-                            let _ = writeln!(
-                                out,
-                                "\n{}{}{}",
-                                palette.bold,
-                                rel.display(),
-                                palette.reset
-                            );
-                            last_file = Some(path.clone());
-                        }
-                        let _ = writeln!(
-                            out,
-                            "  {}fix{} {}{}{}  {}",
-                            palette.warn,
-                            palette.reset,
-                            palette.dim,
-                            group.line,
-                            palette.reset,
-                            diagnostic.message,
-                        );
-                        applied += 1;
-                    }
-                } else if is_fatal(diagnostic) {
-                    conflicts += 1;
-                }
-            }
+    // Pass 1: diagnose, batching blocks across files into full chunks.
+    let mut edits_by_block: BTreeMap<BlockKey, Vec<ValueEdit>> = BTreeMap::new();
+    let mut buffer: Vec<ClassGroup> = Vec::new();
+    let total_blocks = each_source_file(config, &matcher, &root, |_path, _text, mut blocks| {
+        buffer.append(&mut blocks);
+        while buffer.len() >= CHUNK_SIZE {
+            let rest = buffer.split_off(CHUNK_SIZE);
+            diagnose_fix_chunk(
+                &mut client,
+                &mut document,
+                &buffer,
+                &root,
+                &palette,
+                &mut out,
+                &mut last_file,
+                &mut edits_by_block,
+                &mut applied,
+                &mut conflicts,
+            )?;
+            buffer = rest;
         }
+        Ok(())
+    })?;
+    if !buffer.is_empty() {
+        diagnose_fix_chunk(
+            &mut client,
+            &mut document,
+            &buffer,
+            &root,
+            &palette,
+            &mut out,
+            &mut last_file,
+            &mut edits_by_block,
+            &mut applied,
+            &mut conflicts,
+        )?;
+    }
 
-        // Resolve every block against its edits and rewrite the file once.
+    document.close(&mut client)?;
+    client.shutdown()?;
+    ensure_blocks_matched(total_blocks)?;
+
+    // Pass 2: re-read each file and rewrite it from the recorded edits. The files
+    // are untouched until here, so re-extraction yields the same blocks (and the
+    // same `list_span.start` keys) pass 1 saw.
+    each_source_file(config, &matcher, &root, |path, text, blocks| {
         let mut rewrites: Vec<(std::ops::Range<usize>, String)> = Vec::new();
-        for (local, group) in blocks.iter().enumerate() {
-            let edits = edits_by_block.remove(&local).unwrap_or_default();
+        for group in &blocks {
+            let edits = edits_by_block
+                .remove(&(path.clone(), group.list_span.start))
+                .unwrap_or_default();
             let had_class_fix = !edits.is_empty();
             let resolved = resolve_classes(group, &edits);
             let layout = BlockLayout::at(&text, group.list_span.start);
@@ -457,13 +518,8 @@ pub fn run_join_fix(config: &LintConfig) -> Result<()> {
             }
             std::fs::write(&path, updated)?;
         }
-        let _ = out.flush();
         Ok(())
     })?;
-
-    document.close(&mut client)?;
-    client.shutdown()?;
-    ensure_blocks_matched(total_blocks)?;
 
     let _ = writeln!(
         out,
@@ -475,11 +531,54 @@ pub fn run_join_fix(config: &LintConfig) -> Result<()> {
     Ok(())
 }
 
+/// Diagnose one cross-file chunk, recording deduped conflict pairs keyed by
+/// block. The LSP reports each conflict twice (A vs B and B vs A); `seen`
+/// collapses them.
+fn diagnose_resolve_chunk(
+    client: &mut Client,
+    document: &mut Synthetic,
+    chunk: &[ClassGroup],
+    conflicts_by_block: &mut BTreeMap<BlockKey, Vec<(String, String)>>,
+    seen: &mut std::collections::HashSet<(PathBuf, usize, String)>,
+) -> Result<()> {
+    let diagnostics = document.diagnose(client, chunk)?;
+    for diagnostic in &diagnostics {
+        if is_canonical(diagnostic) || !is_fatal(diagnostic) {
+            continue;
+        }
+        let (a, b) = match conflict_pair(&diagnostic.message) {
+            Some(pair) => pair,
+            None => continue,
+        };
+        let local = diagnostic.range.start.line as usize;
+        let group = match chunk.get(local) {
+            Some(group) => group,
+            None => continue,
+        };
+        let mut ordered = [a, b];
+        ordered.sort();
+        let key = (group.file.clone(), group.list_span.start);
+        if seen.insert((key.0.clone(), key.1, ordered.join("\u{0}"))) {
+            let [first, second] = ordered;
+            conflicts_by_block
+                .entry(key)
+                .or_default()
+                .push((first, second));
+        }
+    }
+    Ok(())
+}
+
 /// Interactively resolve conflicts: show each one and let the user pick the
 /// class to keep. The tool applies the choice and never guesses.
 ///
-/// Processes one file at a time so memory never grows with the corpus; conflicts
-/// are surfaced and resolved per file as they are found.
+/// Two passes. Pass 1 diagnoses every block in cross-file chunks (one
+/// `didChange` per chunk, never per file) and records the conflicts, then shuts
+/// the server down — diagnosing per file would pay the 500ms debounce per file
+/// and leak server memory until it OOMs, and it would also pin the server open
+/// across the whole interactive session. Pass 2 re-reads each file and prompts
+/// only for the blocks that have conflicts. Only the (sparse) conflict map lives
+/// between passes, so memory stays bounded regardless of corpus size.
 pub fn run_join_resolve(config: &LintConfig) -> Result<()> {
     let matcher = GroupMatcher::from_config(config)?;
     let root = std::fs::canonicalize(&config.root)?;
@@ -491,43 +590,58 @@ pub fn run_join_resolve(config: &LintConfig) -> Result<()> {
     let mut resolved = 0;
     let mut quit = false;
 
-    let total_blocks = each_source_file(config, &matcher, &root, |path, text, blocks| {
+    // Pass 1: diagnose, batching blocks across files into full chunks.
+    let mut conflicts_by_block: BTreeMap<BlockKey, Vec<(String, String)>> = BTreeMap::new();
+    let mut seen: std::collections::HashSet<(PathBuf, usize, String)> =
+        std::collections::HashSet::new();
+    let mut buffer: Vec<ClassGroup> = Vec::new();
+    let total_blocks = each_source_file(config, &matcher, &root, |_path, _text, mut blocks| {
+        buffer.append(&mut blocks);
+        while buffer.len() >= CHUNK_SIZE {
+            let rest = buffer.split_off(CHUNK_SIZE);
+            diagnose_resolve_chunk(
+                &mut client,
+                &mut document,
+                &buffer,
+                &mut conflicts_by_block,
+                &mut seen,
+            )?;
+            buffer = rest;
+        }
+        Ok(())
+    })?;
+    if !buffer.is_empty() {
+        diagnose_resolve_chunk(
+            &mut client,
+            &mut document,
+            &buffer,
+            &mut conflicts_by_block,
+            &mut seen,
+        )?;
+    }
+
+    document.close(&mut client)?;
+    client.shutdown()?;
+    ensure_blocks_matched(total_blocks)?;
+
+    // Pass 2: re-read each file and prompt for its conflicting blocks. The files
+    // are untouched until here, so re-extraction yields the same blocks (and the
+    // same `list_span.start` keys) pass 1 recorded.
+    each_source_file(config, &matcher, &root, |path, text, blocks| {
         if quit {
             return Ok(());
         }
-        // Deduped conflict pairs per block (index within this file).
-        let mut conflicts: BTreeMap<usize, Vec<(String, String)>> = BTreeMap::new();
-        let mut seen: std::collections::HashSet<(usize, String)> = std::collections::HashSet::new();
-        for (chunk_index, chunk) in blocks.chunks(CHUNK_SIZE).enumerate() {
-            let base = chunk_index * CHUNK_SIZE;
-            let diagnostics = document.diagnose(&mut client, chunk)?;
-            for diagnostic in &diagnostics {
-                if is_canonical(diagnostic) || !is_fatal(diagnostic) {
-                    continue;
-                }
-                let (a, b) = match conflict_pair(&diagnostic.message) {
-                    Some(pair) => pair,
-                    None => continue,
-                };
-                let local = base + diagnostic.range.start.line as usize;
-                let mut ordered = [a, b];
-                ordered.sort();
-                let key = (local, ordered.join("\u{0}"));
-                if seen.insert(key) {
-                    let [first, second] = ordered;
-                    conflicts.entry(local).or_default().push((first, second));
-                }
-            }
-        }
-        if conflicts.is_empty() {
-            return Ok(());
-        }
-
         let mut rewrites: Vec<(std::ops::Range<usize>, String)> = Vec::new();
-        for (local, pairs) in &conflicts {
-            let group = &blocks[*local];
+        for group in &blocks {
+            if quit {
+                break;
+            }
+            let pairs = match conflicts_by_block.remove(&(path.clone(), group.list_span.start)) {
+                Some(pairs) => pairs,
+                None => continue,
+            };
             let mut remove: std::collections::HashSet<String> = std::collections::HashSet::new();
-            for (a, b) in pairs {
+            for (a, b) in &pairs {
                 if remove.contains(a) || remove.contains(b) {
                     continue;
                 }
@@ -591,9 +705,6 @@ pub fn run_join_resolve(config: &LintConfig) -> Result<()> {
                 rewrites.push((group.list_span.clone(), replacement));
                 resolved += remove.len();
             }
-            if quit {
-                break;
-            }
         }
 
         if !rewrites.is_empty() {
@@ -606,10 +717,6 @@ pub fn run_join_resolve(config: &LintConfig) -> Result<()> {
         }
         Ok(())
     })?;
-
-    document.close(&mut client)?;
-    client.shutdown()?;
-    ensure_blocks_matched(total_blocks)?;
 
     if resolved == 0 {
         println!("{}✓ no conflicts resolved{}", palette.bold, palette.reset);

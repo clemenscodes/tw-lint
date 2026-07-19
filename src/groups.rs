@@ -40,15 +40,20 @@ impl GroupMatcher {
     }
 
     pub fn extract(&self, file: &Path, text: &str) -> Vec<ClassGroup> {
+        // Scan a comment-masked copy so a quoted string or a stray bracket that
+        // only appears in a Rust comment inside the block is never mistaken for a
+        // class or for the macro's closing `]`. The mask keeps byte length, so
+        // every offset below still points into the original text.
+        let masked = mask_comments(text);
         let mut groups = Vec::new();
-        for opener in self.opener.find_iter(text) {
+        for opener in self.opener.find_iter(&masked) {
             // The opener regex ends at the macro's `[`; scan for its match.
             let content_start = opener.end();
-            let content_end = match matching_close(text, content_start) {
+            let content_end = match matching_close(&masked, content_start) {
                 Some(end) => end,
                 None => continue,
             };
-            let inner = &text[content_start..content_end];
+            let inner = &masked[content_start..content_end];
             let classes: Vec<String> = self
                 .item
                 .captures_iter(inner)
@@ -57,7 +62,7 @@ impl GroupMatcher {
             if classes.is_empty() {
                 continue;
             }
-            let line = text[..opener.start()]
+            let line = masked[..opener.start()]
                 .bytes()
                 .filter(|&byte| byte == b'\n')
                 .count()
@@ -106,6 +111,79 @@ fn matching_close(text: &str, content_start: usize) -> Option<usize> {
         }
     }
     None
+}
+
+/// Return a copy of `text` with the bytes of every Rust comment replaced by
+/// spaces, keeping newlines and total length so byte offsets stay valid. String
+/// literals are left untouched, a `//` or `/*` inside a string does not open a
+/// comment, and block comments nest the way Rust's do. Non-ASCII bytes inside a
+/// comment become spaces one byte at a time, which stays valid UTF-8 because a
+/// space is one byte.
+fn mask_comments(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = text.as_bytes().to_vec();
+    let mut index = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut block_depth: usize = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if block_depth > 0 {
+            if byte == b'/' && bytes.get(index + 1) == Some(&b'*') {
+                out[index] = b' ';
+                out[index + 1] = b' ';
+                block_depth += 1;
+                index += 2;
+                continue;
+            }
+            if byte == b'*' && bytes.get(index + 1) == Some(&b'/') {
+                out[index] = b' ';
+                out[index + 1] = b' ';
+                block_depth -= 1;
+                index += 2;
+                continue;
+            }
+            if byte != b'\n' {
+                out[index] = b' ';
+            }
+            index += 1;
+            continue;
+        }
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            index += 1;
+            continue;
+        }
+        if byte == b'"' {
+            in_string = true;
+            index += 1;
+            continue;
+        }
+        if byte == b'/' && bytes.get(index + 1) == Some(&b'/') {
+            let mut scan = index;
+            while scan < bytes.len() && bytes[scan] != b'\n' {
+                out[scan] = b' ';
+                scan += 1;
+            }
+            index = scan;
+            continue;
+        }
+        if byte == b'/' && bytes.get(index + 1) == Some(&b'*') {
+            out[index] = b' ';
+            out[index + 1] = b' ';
+            block_depth = 1;
+            index += 2;
+            continue;
+        }
+        index += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| text.to_string())
 }
 
 #[cfg(test)]
@@ -159,6 +237,50 @@ mod tests {
         );
         // The span must cover the whole list, ending at the real closing `]`.
         assert!(text[groups[0].list_span.clone()].contains("w-[26cqi]"));
+    }
+
+    #[test]
+    fn ignores_quoted_strings_in_a_line_comment() {
+        // A `//` comment inside the block mentions "Backspace" and "Num7" in
+        // quotes. Those are prose, not classes, and must not be extracted — the
+        // bug that promoted them to real classes on --fix.
+        let text = concat!(
+            "let _ = tw![\n",
+            "    \"mobile:pb-6\",\n",
+            "    // labels run to \"Backspace\" and \"Num7\", so size off those\n",
+            "    \"mobile:[--key-slot:13.7cqi]\",\n",
+            "];"
+        );
+        let groups = matcher().extract(Path::new("a.rs"), text);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            groups[0].classes,
+            vec!["mobile:pb-6", "mobile:[--key-slot:13.7cqi]"]
+        );
+    }
+
+    #[test]
+    fn ignores_brackets_and_quotes_in_a_block_comment() {
+        // A `/* */` comment carrying an unbalanced `]` and a lone `"` must not
+        // close the macro early or open a phantom string.
+        let text = concat!(
+            "let _ = tw![\n",
+            "    \"flex\",\n",
+            "    /* danger: a ] and a lone \" live here */\n",
+            "    \"gap-2\",\n",
+            "];"
+        );
+        let groups = matcher().extract(Path::new("a.rs"), text);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].classes, vec!["flex", "gap-2"]);
+    }
+
+    #[test]
+    fn a_commented_out_opener_starts_no_block() {
+        let text = concat!("// let _ = tw![\"ghost\"];\n", "let _ = tw![\"flex\"];");
+        let groups = matcher().extract(Path::new("a.rs"), text);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].classes, vec!["flex"]);
     }
 
     #[test]
